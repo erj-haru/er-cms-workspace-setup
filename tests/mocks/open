@@ -1,0 +1,5 @@
+#!/bin/bash
+# テスト用の open モック（ブラウザは開かず、呼び出しを記録する）。MOCK_OPEN=fail で失敗させる
+printf 'open %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+[ "${MOCK_OPEN:-}" = fail ] && exit 1
+exit 0

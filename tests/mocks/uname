@@ -1,0 +1,3 @@
+#!/bin/bash
+# テスト用の uname モック（MOCK_UNAME で OS 名を切り替える。既定は Darwin）
+echo "${MOCK_UNAME:-Darwin}"

@@ -1,0 +1,5 @@
+# 配布用 ZIP（scripts/package-skill.sh で生成）
+dist/*.zip
+
+# macOS
+.DS_Store

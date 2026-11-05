@@ -1,0 +1,4 @@
+#!/bin/bash
+# テスト用の brew モック。インストールは決して行わない（呼ばれたら記録して失敗する）。
+printf 'brew %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+exit 1

@@ -1,0 +1,60 @@
+#!/bin/bash
+# テスト用の git モック。
+# - 呼び出しをすべて $MOCK_LOG に記録する
+# - 「clone」と「--version」だけを差し替え、それ以外は本物の git（$MOCK_REAL_GIT）に渡す
+# - 動作は環境変数 MOCK_GIT_CLONE で切り替える:
+#     ok（既定） / fail-network / fail-notfound / missing-files / wrong-remote
+printf 'git %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+
+real_git() { PATH="$MOCK_ORIG_PATH" "$MOCK_REAL_GIT" "$@"; }
+
+if [ "${1-}" = "--version" ]; then
+  echo "git version 9.9.9-mock"
+  exit 0
+fi
+
+is_clone=0
+for a in "$@"; do
+  [ "$a" = "clone" ] && is_clone=1 && break
+done
+
+if [ $is_clone -eq 1 ]; then
+  # 最後の 2 つの引数が URL と保存先
+  n=$#
+  url="${@:$((n - 1)):1}"
+  dest="${@:$n:1}"
+  case "${MOCK_GIT_CLONE:-ok}" in
+    fail-network)
+      echo "fatal: unable to access '${url}': Could not resolve host: github.com" >&2
+      exit 128
+      ;;
+    fail-notfound)
+      echo "remote: Repository not found." >&2
+      echo "fatal: repository '${url}' not found" >&2
+      exit 128
+      ;;
+  esac
+  if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+    echo "fatal: destination path '${dest}' already exists and is not an empty directory." >&2
+    exit 128
+  fi
+  real_git init -q "$dest" || exit 128
+  remote="$url"
+  [ "${MOCK_GIT_CLONE:-ok}" = "wrong-remote" ] && remote="https://github.com/someone/another-repo.git"
+  real_git -C "$dest" remote add origin "$remote"
+  if [ "${MOCK_GIT_CLONE:-ok}" != "missing-files" ]; then
+    mkdir -p "$dest/.claude/skills/setup-editor" "$dest/.claude/skills/cms-help"
+    echo '{"name":"mock-cms"}' > "$dest/package.json"
+    echo 'export default {}' > "$dest/astro.config.mjs"
+    echo 'services: {}' > "$dest/compose.yaml"
+    echo '# setup-editor' > "$dest/.claude/skills/setup-editor/SKILL.md"
+    echo '# cms-help' > "$dest/.claude/skills/cms-help/SKILL.md"
+  else
+    echo '{"name":"mock-cms"}' > "$dest/package.json"
+  fi
+  real_git -C "$dest" add -A
+  real_git -C "$dest" -c user.name=mock -c user.email=mock@example.invalid commit -q -m init
+  exit 0
+fi
+
+real_git "$@"

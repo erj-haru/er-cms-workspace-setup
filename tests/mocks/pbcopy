@@ -1,0 +1,4 @@
+#!/bin/bash
+# テスト用の pbcopy モック（$MOCK_CLIPBOARD ファイルをクリップボードとして使う）
+printf 'pbcopy\n' >> "${MOCK_LOG:-/dev/null}"
+cat > "${MOCK_CLIPBOARD:-/dev/null}"

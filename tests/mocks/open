@@ -1,0 +1,24 @@
+#!/bin/bash
+# テスト用の open モック（ブラウザやインストーラーは開かず、呼び出しを記録する）
+#   MOCK_OPEN=fail で失敗させる
+#   .pkg を開いた場合（Homebrew インストーラー）: MOCK_PKG_INSTALL=ok（既定。少し後に完了）/ cancel（完了しない）
+#   MOCK_PKG_PATHSD=no なら /etc/paths.d/homebrew を作らない
+printf 'open %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+[ "${MOCK_OPEN:-}" = fail ] && exit 1
+case "${1-}" in
+  *.pkg)
+    if [ "${MOCK_PKG_INSTALL:-ok}" = ok ]; then
+      (
+        sleep 1
+        p="${MOCK_ROOT:?}/opt/homebrew"
+        mkdir -p "$p/bin" "$p/sbin"
+        ln -sf "${MOCK_DIR:?}/brew" "$p/bin/brew"
+        if [ "${MOCK_PKG_PATHSD:-yes}" = yes ]; then
+          mkdir -p "$MOCK_ROOT/etc/paths.d"
+          echo "$p/bin" > "$MOCK_ROOT/etc/paths.d/homebrew"
+        fi
+      ) >/dev/null 2>&1 &
+    fi
+    ;;
+esac
+exit 0

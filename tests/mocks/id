@@ -1,0 +1,8 @@
+#!/bin/bash
+# テスト用の id モック（MOCK_ADMIN=no で管理者以外）
+case "$*" in
+  -Gn) if [ "${MOCK_ADMIN:-yes}" = no ]; then echo "staff everyone"; else echo "staff everyone admin"; fi ;;
+  -un) echo "mock-user" ;;
+  -u) echo 501 ;;
+  *) echo "uid=501(mock-user)" ;;
+esac

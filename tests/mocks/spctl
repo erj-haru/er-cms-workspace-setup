@@ -1,0 +1,7 @@
+#!/bin/bash
+# テスト用の spctl モック（MOCK_SPCTL=ok（既定）/ reject）
+printf 'spctl %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+if [ "${MOCK_SPCTL:-ok}" = reject ]; then
+  echo "pkg: rejected"; echo "source=no usable signature"; exit 3
+fi
+echo "pkg: accepted"; echo "source=Notarized Developer ID"; echo "origin=Developer ID Installer: Patrick Linnane (927JGANW46)"

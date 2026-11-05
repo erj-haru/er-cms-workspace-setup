@@ -1,0 +1,4 @@
+#!/bin/bash
+# テスト用の pbpaste モック
+[ -f "${MOCK_CLIPBOARD:-}" ] && cat "$MOCK_CLIPBOARD"
+exit 0

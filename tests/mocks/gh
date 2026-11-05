@@ -1,0 +1,166 @@
+#!/bin/bash
+# テスト用の gh モック。呼び出しを $MOCK_LOG に記録する。
+# 状態（ログイン済みアカウント）は $MOCK_GH_STATE ファイルに保存し、switch / login で更新する。
+#   $MOCK_GH_STATE の各行: 「ログイン名 状態(success|error|timeout) active(yes|no)」
+#   ファイルがない場合の初期値: MOCK_GH_AUTH=ok（既定）なら MOCK_GH_USER（既定 mock-editor）が使用中
+#
+# 環境変数:
+#   MOCK_GH_AUTH=ok / none / offline   初期状態（ファイルがない時のみ）
+#   MOCK_GH_USER=ログイン名
+#   MOCK_GH_REPO_ACCESS=カンマ区切り    リポジトリにアクセスできるアカウント（既定: 全員）
+#   MOCK_GH_JSON=unsupported            auth status --json に未対応の古い gh を再現
+#   MOCK_GH_CLIPBOARD=unsupported       auth login --clipboard に未対応の古い gh を再現
+#   MOCK_GH_SWITCH=fail                 auth switch を失敗させる
+#   MOCK_GH_LOGIN=ok / denied / expired / hang / noclip / network / error
+#   MOCK_GH_LOGIN_USER=ログイン後のアカウント（既定 new-editor）
+#   MOCK_CLIPBOARD=クリップボードを表すファイル
+printf 'gh %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+
+STATE="${MOCK_GH_STATE:-/dev/null}"
+MOCK_CODE="WXYZ-9876"
+
+init_state() {
+  [ -f "$STATE" ] && return
+  case "${MOCK_GH_AUTH:-ok}" in
+    ok) echo "${MOCK_GH_USER:-mock-editor} success yes" > "$STATE" ;;
+    offline) echo "${MOCK_GH_USER:-mock-editor} timeout yes" > "$STATE" ;;
+    *) : > "$STATE" ;;
+  esac
+}
+active_user() { awk '$3=="yes"{print $1}' "$STATE"; }
+active_state() { awk '$3=="yes"{print $2}' "$STATE"; }
+has_access() {
+  local u="$1"
+  [ -z "${MOCK_GH_REPO_ACCESS+x}" ] && return 0
+  case ",${MOCK_GH_REPO_ACCESS}," in *",${u},"*) return 0 ;; esac
+  return 1
+}
+set_active() {
+  # $1 を使用中にする（なければ追加）。他のアカウントは残す
+  local u="$1" tmp="${STATE}.tmp"
+  awk -v u="$u" 'BEGIN{f=0} {if($1==u){print $1" success yes";f=1}else{print $1" "$2" no"}} END{if(!f)print u" success yes"}' "$STATE" > "$tmp"
+  mv "$tmp" "$STATE"
+}
+
+init_state
+args=" $* "
+
+case "$1 ${2-}" in
+  "--version ")
+    echo "gh version 9.9.9-mock (2026-01-01)"
+    ;;
+  "auth status")
+    if [[ "$args" == *" --json "* ]]; then
+      if [ "${MOCK_GH_JSON:-}" = unsupported ]; then
+        echo "unknown flag: --json" >&2
+        exit 1
+      fi
+      # 本物の gh では --jq で整形した結果（ログイン名・使用中・状態・エラー）を TSV で返す
+      [ -s "$STATE" ] || echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
+      awk '{printf "%s\t%s\t%s\t%s\n", $1, ($3=="yes"?"true":"false"), $2, ($2=="timeout"?"error connecting to api.github.com":"")}' "$STATE"
+      exit 0
+    fi
+    if [ ! -s "$STATE" ]; then
+      echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2
+      exit 1
+    fi
+    case "$(active_state)" in
+      success)
+        echo "github.com"
+        echo "  ✓ Logged in to github.com account $(active_user) (keyring)"
+        echo "  - Token: gho_MOCKSECRETTOKEN0000"
+        exit 0
+        ;;
+      timeout)
+        echo "X Failed to log in to github.com: error connecting to api.github.com" >&2
+        exit 1
+        ;;
+      *)
+        echo "X Failed to log in to github.com account $(active_user) - The token in keyring is invalid." >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  "auth switch")
+    user=""
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--user" ] && user="$2"
+      shift
+    done
+    if [ "${MOCK_GH_SWITCH:-}" = fail ] || ! awk -v u="$user" '$1==u{f=1} END{exit !f}' "$STATE"; then
+      echo "failed to switch account: not logged in to ${user}" >&2
+      exit 1
+    fi
+    set_active "$user"
+    echo "✓ Switched active account for github.com to ${user}" >&2
+    ;;
+  "auth login")
+    if [[ "$args" == *" --help "* ]]; then
+      echo "USAGE"
+      echo "  gh auth login [flags]"
+      echo "FLAGS"
+      [ "${MOCK_GH_CLIPBOARD:-}" = unsupported ] || echo "  -c, --clipboard             Copy one-time OAuth device code to clipboard"
+      echo "  -w, --web                   Open a browser to authenticate"
+      exit 0
+    fi
+    [ -n "${MOCK_GH_PIDFILE:-}" ] && echo $$ > "$MOCK_GH_PIDFILE"
+    echo ""
+    if [ "${MOCK_GH_LOGIN:-ok}" = noclip ]; then
+      echo "! First copy your one-time code: ${MOCK_CODE}"
+    else
+      printf '%s' "$MOCK_CODE" > "${MOCK_CLIPBOARD:-/dev/null}"
+      echo "! One-time code (${MOCK_CODE}) copied to clipboard"
+    fi
+    echo "Open this URL to continue in your web browser: https://github.com/login/device"
+    case "${MOCK_GH_LOGIN:-ok}" in
+      ok)
+        sleep 1
+        set_active "${MOCK_GH_LOGIN_USER:-new-editor}"
+        echo "✓ Authentication complete."
+        echo "✓ Logged in as ${MOCK_GH_LOGIN_USER:-new-editor}"
+        ;;
+      denied)
+        sleep 1
+        echo "error: authorization was denied by the user (access_denied)"
+        exit 1
+        ;;
+      expired)
+        sleep 1
+        echo "error: the device code has expired (expired_token)"
+        exit 1
+        ;;
+      network)
+        echo "error connecting to github.com: dial tcp: lookup github.com: no such host"
+        exit 1
+        ;;
+      error)
+        echo "unexpected failure: gho_LEAKEDTOKEN123 at https://user:pw@github.com"
+        exit 1
+        ;;
+      hang | noclip)
+        sleep 30
+        exit 1
+        ;;
+    esac
+    ;;
+  "auth token")
+    echo "gho_MOCKSECRETTOKEN0000"
+    ;;
+  "api user")
+    [ "$(active_state)" = success ] || exit 1
+    active_user
+    ;;
+  "repo view")
+    u=$(active_user)
+    if [ -n "$u" ] && [ "$(active_state)" = success ] && has_access "$u"; then
+      echo "erj-haru/est-rouge-cms-demo"
+    else
+      echo "GraphQL: Could not resolve to a Repository with the name 'erj-haru/est-rouge-cms-demo'. (repository)" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "mock gh: unsupported: $*" >&2
+    exit 1
+    ;;
+esac

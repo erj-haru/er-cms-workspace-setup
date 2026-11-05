@@ -1,0 +1,30 @@
+#!/bin/bash
+# テスト用の xcode-select モック。開発者ツールは $MOCK_ROOT/Library/Developer/CommandLineTools で表す。
+#   MOCK_CLT_INSTALL=ok（既定。少し後にインストール完了）/ pending（終わらない）/ already / error
+printf 'xcode-select %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+CLT="${MOCK_ROOT:?}/Library/Developer/CommandLineTools"
+case "${1-}" in
+  -p | --print-path)
+    if [ -d "$CLT" ]; then echo "$CLT"; exit 0; fi
+    echo "xcode-select: error: unable to get active developer directory" >&2
+    exit 2
+    ;;
+  --install)
+    case "${MOCK_CLT_INSTALL:-ok}" in
+      already)
+        echo "xcode-select: error: command line tools are already installed, use \"Software Update\" in System Settings to install updates" >&2
+        exit 1
+        ;;
+      error)
+        echo "xcode-select: error: Can't install the software because it is not currently available from the Software Update server." >&2
+        exit 1
+        ;;
+      ok)
+        (sleep 1; mkdir -p "$CLT/usr/bin"; ln -sf "${MOCK_DIR:?}/git" "$CLT/usr/bin/git") >/dev/null 2>&1 &
+        ;;
+    esac
+    echo "xcode-select: note: install requested for command line developer tools" >&2
+    exit 0
+    ;;
+esac
+exit 1

@@ -1,0 +1,4 @@
+#!/bin/bash
+# テスト用の sudo モック。setup.sh から呼ばれてはいけない（呼ばれたら記録して失敗する）
+printf 'sudo %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+exit 1

@@ -1,0 +1,7 @@
+#!/bin/bash
+# テスト用の profiles モック（MOCK_MANAGED=yes で管理下の Mac）
+if [ "${MOCK_MANAGED:-no}" = yes ]; then
+  echo "Enrolled via DEP: Yes"; echo "MDM enrollment: Yes (User Approved)"
+else
+  echo "Enrolled via DEP: No"; echo "MDM enrollment: No"
+fi

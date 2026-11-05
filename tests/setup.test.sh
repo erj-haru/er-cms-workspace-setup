@@ -3,8 +3,12 @@
 # setup.sh のテスト
 #
 # - 一時ディレクトリに「偽のホームフォルダ」を作り、その中だけで動かす
-# - git / gh / uname / brew はモック（tests/mocks）に差し替える
+# - git / gh / brew / uname / sysctl / xcode-select / id / profiles / curl / pkgutil / spctl /
+#   open / pbcopy / pbpaste / sudo / softwareupdate / installer はモック（tests/mocks）に差し替える
 #   （git の clone 以外は本物の git に渡すが、GitHub には一切接続しない）
+# - /opt/homebrew・/Library/Developer・/etc/paths.d などシステムの場所は、
+#   SETUP_WORKSPACE_ROOT で一時フォルダ（$T/root）に置き換える
+# - インストーラー・認証コマンドの本物は PATH に入れないため、テスト中に実行されることはない
 # - PATH はモックと最低限のシステムコマンドだけにするため、
 #   開発者の Mac に入っている本物の gh やログイン状態は使われない
 #
@@ -31,9 +35,13 @@ FAIL=0
 CURRENT=""
 
 # setup.sh が使うシステムコマンド（これ以外は PATH に入れない）
-SYSTEM_TOOLS="tr sed mkdir rmdir ls mktemp mkfifo rm chmod"
+SYSTEM_TOOLS="tr sed mkdir rmdir ls mktemp mkfifo rm chmod cat tail sleep"
+# テストの判定で使うコマンド
+TEST_TOOLS="grep"
 # モックが使うコマンド
-MOCK_TOOLS="awk sleep mv cat"
+MOCK_TOOLS="awk mv ln touch"
+# 常にモックにするコマンド（本物のインストーラー・ブラウザ・クリップボード・管理者権限は使わない）
+ALWAYS_MOCKS="uname sysctl xcode-select id profiles curl pkgutil spctl open pbcopy pbpaste sudo softwareupdate installer"
 # モックの確認用コード（画面に出てはいけない）
 MOCK_CODE="WXYZ-9876"
 
@@ -45,7 +53,8 @@ MOCK_CODE="WXYZ-9876"
 new_env() {
   T=$(mktemp -d "${TMP_ROOT}/case.XXXXXX")
   T=$(cd -P "$T" && pwd -P)
-  mkdir -p "$T/home" "$T/bin" "$T/sys" "$T/outside"
+  mkdir -p "$T/home" "$T/bin" "$T/sys" "$T/outside" "$T/root" "$T/state"
+  SYSROOT="$T/root"
   HOME_DIR="$T/home"
   LOG="$T/calls.log"
   : > "$LOG"
@@ -53,8 +62,8 @@ new_env() {
   for tool in $SYSTEM_TOOLS $MOCK_TOOLS; do
     ln -s "$(command -v "$tool")" "$T/sys/$tool"
   done
-  for tool in "$@" open pbcopy pbpaste; do
-    ln -s "$MOCKS/$tool" "$T/bin/$tool"
+  for tool in "$@" $ALWAYS_MOCKS; do
+    ln -sf "$MOCKS/$tool" "$T/bin/$tool"
   done
   GH_STATE="$T/gh-state"
   CLIPBOARD="$T/clipboard"
@@ -71,7 +80,13 @@ run_setup() {
     PATH="$T/bin:$T/sys" \
     LANG=ja_JP.UTF-8 \
     TMPDIR="$T" \
-    SETUP_WORKSPACE_EXTRA_PATH="" \
+    SHELL=/bin/zsh \
+    SETUP_WORKSPACE_ROOT="$SYSROOT" \
+    SETUP_WORKSPACE_POLL_INTERVAL=1 \
+    SETUP_WORKSPACE_INSTALL_TIMEOUT=8 \
+    MOCK_ROOT="$SYSROOT" \
+    MOCK_DIR="$MOCKS" \
+    MOCK_STATE_DIR="$T/state" \
     GIT_CONFIG_GLOBAL="$T/gitconfig" \
     GIT_CONFIG_NOSYSTEM=1 \
     MOCK_LOG="$LOG" \
@@ -149,7 +164,29 @@ assert_safe_calls() {
   assert_not_log '^git .*(push|pull|fetch|reset|checkout|clean|stash|commit|config --(global|add|unset)|remote (set-url|remove|add))'
   assert_not_log '^gh (auth (logout|token|refresh|setup-git)|pr |repo (clone|create|delete|fork))'
   assert_not_log 'show-token'
-  assert_not_log '^brew '
+  assert_not_log '^brew (uninstall|reinstall|upgrade|update|tap|untap|link|unlink|cleanup|autoremove)'
+  assert_not_log '^(sudo|softwareupdate|installer) '
+}
+# ソフトのインストールを一切始めていないこと（確認だけの処理で使う）
+assert_no_install() {
+  assert_not_log '^brew install'
+  assert_not_log '^xcode-select --install'
+  assert_not_log '^curl '
+  assert_not_log '^open .*\.pkg'
+  assert_not_log '^(sudo|softwareupdate|installer) '
+}
+# システムの場所（$T/root）に、Homebrew や開発者ツールを置く
+install_fake_clt() {
+  mkdir -p "$SYSROOT/Library/Developer/CommandLineTools/usr/bin"
+  ln -sf "$MOCKS/git" "$SYSROOT/Library/Developer/CommandLineTools/usr/bin/git"
+}
+install_fake_brew() {
+  local prefix="$SYSROOT/${1:-opt/homebrew}"
+  mkdir -p "$prefix/bin" "$prefix/sbin"
+  ln -sf "$MOCKS/brew" "$prefix/bin/brew"
+}
+install_fake_gh_in_brew() {
+  ln -sf "$MOCKS/gh" "$SYSROOT/${1:-opt/homebrew}/bin/gh"
 }
 # アカウントの切り替え・ログインをしていないこと（確認だけの処理で使う）
 assert_no_auth_change() {
@@ -206,7 +243,7 @@ run_setup check
 assert_rc 1
 assert_out "MISSING=git,gh"
 assert_out "BREW=no"
-assert_out "Homebrew（Mac 用のソフト追加ツール）は見つかりません"
+assert_out "❌ Homebrew（Mac 用のソフト追加ツール）: 見つかりません"
 
 begin "03c gh が未導入のときは Clone しない"
 new_env git uname
@@ -781,6 +818,478 @@ assert_rc 64
 run_setup login extra
 assert_rc 64
 assert_no_auth_change
+# ============================================================================
+# ソフトの検出と追加（Command Line Tools / Homebrew / gh / PATH）
+# （インストーラー・ダウンロード・管理者権限はすべてモック。実機には一切触れない）
+# ============================================================================
+
+# テスト環境で、本物のインストーラー類が PATH から見えないこと
+begin "20 テスト環境では本物のインストーラー・認証コマンドに届かない"
+new_env uname
+for c in curl sudo softwareupdate installer xcode-select open brew gh git pkgutil spctl; do
+  p=$(env -i PATH="$T/bin:$T/sys" /bin/bash -c "command -v $c" 2>/dev/null)
+  case "$p" in
+    "" | "$T/bin/"*) ok ;;
+    *) fail "本物の $c が見えている: $p" ;;
+  esac
+done
+if grep -nE '(^|[;&|(` ])sudo([[:space:]]|$)' "$SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  fail "setup.sh に sudo の実行が含まれている"
+else ok; fi
+if grep -nE '(^|[;&|(` ])(softwareupdate|installer -pkg)' "$SCRIPT" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  fail "setup.sh に softwareupdate / installer の実行が含まれている"
+else ok; fi
+
+# ---- 21. 環境の検出 ----------------------------------------------------------
+begin "21 Git・gh・Homebrew がすべて未導入（何もインストールしない）"
+new_env
+run_setup check
+assert_rc 1
+assert_out "RESULT=NEED_INSTALL"
+assert_out "MISSING=git,gh"
+assert_out "INSTALL_PLAN=clt,brew,gh"
+assert_out "NEXT=install-clt"
+assert_out "CLT=missing"
+assert_out "BREW=no"
+assert_out "CPU=apple_silicon"
+assert_out "BREW_AUTO_INSTALL=yes"
+assert_no_install
+assert_safe_calls
+# Git が使えない状態で /usr/bin/git を実行しない（インストール画面が勝手に出るため）
+mkdir -p "$SYSROOT/usr/bin"
+ln -sf "$MOCKS/git" "$SYSROOT/usr/bin/git"
+MOCK_ENV=(PATH="$SYSROOT/usr/bin:$T/bin:$T/sys")   # macOS と同じく /usr/bin/git が PATH にある
+: > "$LOG"
+run_setup check
+assert_out "GIT=no"
+assert_not_log '^git --version'
+
+begin "22 Git だけ存在する"
+new_env git
+run_setup check
+assert_rc 1
+assert_out "GIT=yes"
+assert_out "MISSING=gh"
+assert_out "INSTALL_PLAN=clt,brew,gh"   # Homebrew には開発者ツールが必要
+assert_no_install
+
+begin "22b Git と開発者ツールが存在する"
+new_env
+install_fake_clt
+run_setup check
+assert_rc 1
+assert_out "CLT=installed"
+assert_out "GIT=yes"
+assert_out "INSTALL_PLAN=brew,gh"
+assert_out "NEXT=install-brew"
+
+begin "23 Homebrew だけ存在する"
+new_env brew
+run_setup check
+assert_rc 1
+assert_out "BREW=yes"
+assert_out "MISSING=git,gh"
+assert_out "INSTALL_PLAN=clt,gh"
+assert_no_install
+
+begin "24 gh だけ不足している → Homebrew で追加 → 再実行で入れ直さない"
+new_env git brew
+install_fake_clt
+run_setup check
+assert_rc 1
+assert_out "INSTALL_PLAN=gh"
+assert_out "NEXT=install-gh"
+run_setup install-gh
+assert_rc 0
+assert_out "RESULT=GH_READY"
+assert_out "ACTION=installed"
+assert_log "brew install gh"
+run_setup check
+assert_rc 0
+assert_out "RESULT=READY"
+run_setup install-gh
+assert_rc 0
+assert_out "ACTION=unchanged"
+assert_count_log '^brew install' 1
+assert_safe_calls
+
+begin "25 PATH に登録されていない Homebrew・gh・Git を見つける"
+new_env
+install_fake_clt
+install_fake_brew
+install_fake_gh_in_brew
+run_setup check
+assert_rc 0
+assert_out "BREW=yes"
+assert_out "BREW_ON_PATH=no"
+assert_out "BREW_PREFIX=$SYSROOT/opt/homebrew"
+assert_out "PATH）に登録されていなかったため"
+assert_out "GH=yes"
+assert_out "GIT=yes"
+assert_out "RESULT=READY"
+assert_no_install
+# PATH 外の Homebrew・gh でも Clone まで進められる
+run_setup clone "~/EstRouge"
+assert_rc 0
+assert_out "RESULT=CLONED"
+
+begin "25b Intel Mac の Homebrew（/usr/local）を見つける"
+new_env
+MOCK_ENV=(MOCK_CPU=intel MOCK_ARCH=x86_64)
+install_fake_clt
+install_fake_brew usr/local
+install_fake_gh_in_brew usr/local
+run_setup check
+assert_rc 0
+assert_out "CPU=intel"
+assert_out "BREW_PREFIX=$SYSROOT/usr/local"
+assert_out "RESULT=READY"
+
+begin "25c Apple シリコンの互換モード（Rosetta）を判別する"
+new_env git gh brew
+MOCK_ENV=(MOCK_ARCH=x86_64)
+run_setup check
+assert_out "CPU=apple_silicon"
+assert_out "ROSETTA=yes"
+
+begin "25d 管理下の Mac・管理者でないユーザーを表示する"
+new_env git gh brew
+MOCK_ENV=(MOCK_MANAGED=yes MOCK_ADMIN=no)
+run_setup check
+assert_out "MANAGED=yes"
+assert_out "IS_ADMIN=no"
+assert_out "学校・会社などの管理下"
+
+# ---- 26. 開発者ツール（Git） ------------------------------------------------
+begin "26 開発者ツールの追加 → 完了を確認 → 再実行で入れ直さない"
+new_env
+run_setup install-clt
+assert_rc 0
+assert_out "ACTION=install_requested"
+assert_out "RESULT=CLT_READY"
+assert_exists "$SYSROOT/Library/Developer/CommandLineTools/usr/bin/git"
+run_setup install-clt
+assert_rc 0
+assert_out "ACTION=unchanged"
+assert_count_log '^xcode-select --install' 1
+assert_safe_calls
+
+begin "26b 開発者ツールの完了待ちが時間切れ → wait で続きから再開"
+new_env
+MOCK_ENV=(MOCK_CLT_INSTALL=pending SETUP_WORKSPACE_INSTALL_TIMEOUT=2)
+run_setup install-clt
+assert_rc 1
+assert_out "RESULT=INSTALL_WAITING"
+assert_out "NEXT=wait clt"
+install_fake_clt   # 利用者が画面でインストールを完了した
+run_setup wait clt
+assert_rc 0
+assert_out "RESULT=CLT_READY"
+assert_count_log '^xcode-select --install' 1
+
+begin "26c 開発者ツールのインストールが管理ポリシーで禁止されている"
+new_env
+MOCK_ENV=(MOCK_CLT_INSTALL=error)
+run_setup install-clt
+assert_rc 2
+assert_out "RESULT=CLT_FAILED"
+assert_out "管理者に相談してください"
+assert_not_out "RESULT=CLT_READY"
+
+begin "26d 「既に入っている」と言われたが Git がない"
+new_env
+MOCK_ENV=(MOCK_CLT_INSTALL=already)
+run_setup install-clt
+assert_rc 2
+assert_out "RESULT=CLT_FAILED"
+
+# ---- 27. Homebrew -------------------------------------------------------------
+begin "27 Homebrew の追加（公式インストーラーを確認してから開く）"
+new_env
+install_fake_clt
+run_setup install-brew
+assert_rc 0
+assert_out "インストーラーが Homebrew 公式のもの"
+assert_out "ACTION=installer_opened"
+assert_out "RESULT=BREW_READY"
+assert_out "BREW_PATH_PERSISTED=yes"
+assert_log "curl -fsSL --proto =https --tlsv1.2 --max-time 60 https://api.github.com/repos/Homebrew/brew/releases/latest"
+assert_log "https://github.com/Homebrew/brew/releases/download/9.9.9/Homebrew.pkg"
+assert_log "pkgutil --check-signature"
+assert_log "spctl --assess --type install"
+assert_log "open $T/setup-workspace-brew."
+assert_exists "$SYSROOT/opt/homebrew/bin/brew"
+if ls -d "$T"/setup-workspace-brew.* >/dev/null 2>&1; then fail "ダウンロードしたインストーラーが残っている"; else ok; fi
+assert_safe_calls
+# 続けて gh を追加し、確認まで進める
+run_setup install-gh
+assert_rc 0
+assert_out "RESULT=GH_READY"
+
+begin "27b Homebrew が既にあれば入れ直さない"
+new_env git
+install_fake_clt
+install_fake_brew
+run_setup install-brew
+assert_rc 0
+assert_out "ACTION=unchanged"
+assert_out "RESULT=BREW_READY"
+assert_no_install
+
+begin "27c 管理者権限がない"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_ADMIN=no)
+run_setup install-brew
+assert_rc 1
+assert_out "RESULT=NO_ADMIN"
+assert_no_install
+
+begin "27d 開発者ツールがないと Homebrew は入れない"
+new_env
+run_setup install-brew
+assert_rc 1
+assert_out "RESULT=NEED_CLT"
+assert_out "NEXT=install-clt"
+assert_no_install
+
+begin "27e Intel Mac では自動で入れない（手動の案内へ）"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_CPU=intel MOCK_ARCH=x86_64)
+run_setup install-brew
+assert_rc 1
+assert_out "RESULT=BREW_AUTO_UNSUPPORTED"
+assert_no_install
+
+begin "27f Homebrew インストール失敗: 情報を取得できない"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_CURL_API=fail)
+run_setup install-brew
+assert_rc 2
+assert_out "RESULT=BREW_DOWNLOAD_FAILED"
+assert_not_log '^open '
+assert_not_log 'Homebrew\.pkg'
+
+begin "27g Homebrew インストール失敗: 公式以外の配布元は使わない"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_CURL_API=badurl)
+run_setup install-brew
+assert_rc 2
+assert_out "RESULT=BREW_DOWNLOAD_FAILED"
+assert_not_log 'evil\.example\.com'
+assert_not_log '^open '
+
+begin "27h Homebrew インストール失敗: ダウンロードできない・空のファイル"
+for mode in fail empty; do
+  new_env
+  install_fake_clt
+  MOCK_ENV=(MOCK_CURL_PKG=$mode)
+  run_setup install-brew
+  assert_rc 2
+  assert_out "RESULT=BREW_DOWNLOAD_FAILED"
+  assert_not_log '^(open|pkgutil|spctl) '
+  if ls -d "$T"/setup-workspace-brew.* >/dev/null 2>&1; then fail "作業フォルダが残っている"; else ok; fi
+done
+
+begin "27i Homebrew インストール失敗: 署名を確認できないものは実行しない"
+for sig in unsigned wrongteam notnotarized; do
+  new_env
+  install_fake_clt
+  MOCK_ENV=(MOCK_PKG_SIG=$sig)
+  run_setup install-brew
+  assert_rc 2
+  assert_out "RESULT=BREW_VERIFY_FAILED"
+  assert_not_log '^open '
+  if ls "$T"/setup-workspace-brew.*/Homebrew.pkg >/dev/null 2>&1; then fail "検証に失敗したファイルが残っている"; else ok; fi
+done
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_SPCTL=reject)
+run_setup install-brew
+assert_rc 2
+assert_out "RESULT=BREW_VERIFY_FAILED"
+assert_not_log '^open '
+
+begin "27j インストール途中での中断 → 再実行で続きから復旧"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_PKG_INSTALL=cancel SETUP_WORKSPACE_INSTALL_TIMEOUT=2)
+run_setup install-brew
+assert_rc 1
+assert_out "RESULT=INSTALL_WAITING"
+assert_out "NEXT=wait brew"
+assert_absent "$SYSROOT/opt/homebrew/bin/brew"
+# もう一度実行すると、改めて確認してからインストーラーを開き直す
+MOCK_ENV=(MOCK_PKG_INSTALL=ok)
+run_setup install-brew
+assert_rc 0
+assert_out "RESULT=BREW_READY"
+assert_count_log '^open .*\.pkg' 2
+# 以後は入れ直さない
+run_setup install-brew
+assert_out "ACTION=unchanged"
+assert_count_log '^open .*\.pkg' 2
+
+begin "27k インストーラーで完了した後に wait で再開"
+new_env
+install_fake_clt
+MOCK_ENV=(MOCK_PKG_INSTALL=cancel SETUP_WORKSPACE_INSTALL_TIMEOUT=2)
+run_setup install-brew
+assert_out "RESULT=INSTALL_WAITING"
+install_fake_brew
+run_setup wait brew
+assert_rc 0
+assert_out "RESULT=BREW_READY"
+
+# ---- 28. gh の追加の失敗と復旧 ---------------------------------------------
+begin "28 gh の追加失敗（ネットワーク・実行中・権限）"
+for mode in network:NETWORK_ERROR locked:BREW_BUSY permission:BREW_PERMISSION; do
+  new_env git brew
+  MOCK_ENV=(MOCK_BREW_GH=${mode%%:*})
+  run_setup install-gh
+  assert_rc 2
+  assert_out "RESULT=${mode#*:}"
+  assert_not_out "RESULT=GH_READY"
+done
+
+begin "28b gh の追加が途中で中断 → 再実行で復旧"
+new_env git brew
+MOCK_ENV=(MOCK_BREW_GH=interrupt-once)
+run_setup install-gh
+assert_rc 2
+assert_out "RESULT=GH_INSTALL_FAILED"
+run_setup install-gh
+assert_rc 0
+assert_out "RESULT=GH_READY"
+
+begin "28c Homebrew がなければ gh は追加しない"
+new_env git
+run_setup install-gh
+assert_rc 1
+assert_out "RESULT=NEED_BREW"
+assert_no_install
+
+# ---- 29. PATH の永続化 -------------------------------------------------------
+begin "29 PATH の設定が必要か確認 → 必要な場合だけ 1 回追記"
+new_env git
+install_fake_brew
+printf 'export FOO=1\nalias ll="ls -l"' > "$HOME_DIR/.zprofile"   # 末尾に改行なし
+run_setup path-status
+assert_rc 0
+assert_out "BREW_PATH_PERSISTED=no"
+assert_out "PROFILE_FILE=$HOME_DIR/.zprofile"
+run_setup persist-path
+assert_rc 0
+assert_out "RESULT=PATH_PERSISTED"
+if grep -qx 'export FOO=1' "$HOME_DIR/.zprofile" && grep -qx 'alias ll="ls -l"' "$HOME_DIR/.zprofile"; then ok; else fail "既存の設定が壊れた"; fi
+if grep -qF "eval \"\$($SYSROOT/opt/homebrew/bin/brew shellenv)\"" "$HOME_DIR/.zprofile"; then ok; else fail "brew shellenv が追記されていない"; fi
+run_setup persist-path
+assert_rc 0
+assert_out "RESULT=ALREADY_CONFIGURED"
+n=$(grep -c 'brew shellenv' "$HOME_DIR/.zprofile")
+if [ "$n" -eq 1 ]; then ok; else fail "設定が重複して追記された（${n} 件）"; fi
+run_setup path-status
+assert_out "BREW_PATH_PERSISTED=yes"
+
+begin "29b 既に設定済み（/etc/paths.d または自分の設定）なら追記しない"
+new_env git
+install_fake_brew
+mkdir -p "$SYSROOT/etc/paths.d"
+echo "$SYSROOT/opt/homebrew/bin" > "$SYSROOT/etc/paths.d/homebrew"
+run_setup persist-path
+assert_out "RESULT=ALREADY_CONFIGURED"
+assert_absent "$HOME_DIR/.zprofile"
+new_env git
+install_fake_brew
+echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' > "$HOME_DIR/.zshrc"
+run_setup persist-path
+assert_out "RESULT=ALREADY_CONFIGURED"
+assert_absent "$HOME_DIR/.zprofile"
+
+begin "29c bash は .bash_profile、それ以外のシェルは自動で変更しない"
+new_env git
+install_fake_brew
+MOCK_ENV=(SHELL=/bin/bash)
+run_setup persist-path
+assert_out "RESULT=PATH_PERSISTED"
+assert_exists "$HOME_DIR/.bash_profile"
+new_env git
+install_fake_brew
+MOCK_ENV=(SHELL=/opt/homebrew/bin/fish)
+run_setup persist-path
+assert_rc 1
+assert_out "RESULT=UNSUPPORTED_SHELL"
+
+# ---- 30. 何もない状態から Clone まで（再実行で復旧） ---------------------------
+begin "30 何もない Mac から Clone まで（途中で止まっても続きから）"
+new_env
+set_accounts
+run_setup check
+assert_out "NEXT=install-clt"
+run_setup install-clt
+assert_out "RESULT=CLT_READY"
+run_setup check
+assert_out "NEXT=install-brew"
+MOCK_ENV=(MOCK_BREW_GH=interrupt-once)
+run_setup install-brew
+assert_out "RESULT=BREW_READY"
+run_setup check
+assert_out "NEXT=install-gh"
+run_setup install-gh
+assert_rc 2                       # 1 回目は中断
+run_setup check
+assert_out "NEXT=install-gh"      # 再確認すると、続きは gh から
+run_setup install-gh
+assert_out "RESULT=GH_READY"
+run_setup check
+assert_out "RESULT=NEED_LOGIN"
+MOCK_ENV=(MOCK_GH_LOGIN=ok MOCK_GH_LOGIN_USER=editor)
+run_setup login
+assert_out "RESULT=READY"
+run_setup clone "~/EstRouge"
+assert_rc 0
+assert_out "RESULT=CLONED"
+run_setup check
+assert_rc 0
+assert_out "EXISTING_CLONE=$HOME_DIR/EstRouge/est-rouge-cms-demo"
+assert_count_log '^xcode-select --install' 1
+assert_count_log '^open .*\.pkg' 1
+assert_safe_calls
+
+begin "31 インストールを断った場合（確認だけ繰り返しても何も変わらない）"
+new_env
+for i in 1 2; do
+  run_setup check
+  assert_rc 1
+  assert_out "RESULT=NEED_INSTALL"
+done
+assert_no_install
+if [ -z "$(ls -A "$SYSROOT")" ]; then ok; else fail "システムの場所に変更がある"; fi
+if [ -z "$(ls -A "$HOME_DIR")" ]; then ok; else fail "ホームフォルダに変更がある"; fi
+
+begin "32 使い方の誤り（インストール関連）"
+new_env
+run_setup wait
+assert_rc 64
+run_setup wait gh
+assert_rc 64
+run_setup install-gh now
+assert_rc 64
+assert_no_install
+
+begin "33 macOS 以外ではインストールしない"
+new_env
+MOCK_ENV=(MOCK_UNAME=Linux)
+for c in install-clt install-brew install-gh; do
+  run_setup "$c"
+  assert_rc 1
+  assert_out "RESULT=UNSUPPORTED_OS"
+done
+assert_no_install
+
 # ============================================================================
 echo ""
 echo "結果: 成功 ${PASS} 件 / 失敗 ${FAIL} 件（対象: ${SCRIPT}）"

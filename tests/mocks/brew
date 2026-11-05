@@ -1,4 +1,43 @@
 #!/bin/bash
-# テスト用の brew モック。インストールは決して行わない（呼ばれたら記録して失敗する）。
+# テスト用の brew モック（実際のインストールはしない）。呼び出しを記録する。
+# prefix は、このモックが置かれた場所（…/bin/brew の 2 つ上）とする。
+#   MOCK_BREW_GH=ok（既定）/ network / locked / permission / interrupt-once（1 回目だけ中断）
 printf 'brew %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
-exit 1
+self="$0"
+bindir="${self%/*}"
+prefix="${bindir%/*}"
+case "$*" in
+  --version) echo "Homebrew 9.9.9-mock" ;;
+  --prefix) echo "$prefix" ;;
+  shellenv) echo "export PATH=\"$prefix/bin:$prefix/sbin\${PATH+:\$PATH}\";" ;;
+  "install gh")
+    case "${MOCK_BREW_GH:-ok}" in
+      network)
+        echo "==> Downloading https://ghcr.io/v2/homebrew/core/gh/manifests/9.9.9"
+        echo "curl: (6) Could not resolve host: ghcr.io"
+        echo "Error: Failed to download resource \"gh_bottle_manifest\""
+        exit 1
+        ;;
+      locked)
+        echo "Error: A \`brew install gh\` process has already locked /opt/homebrew/Cellar/gh."
+        exit 1
+        ;;
+      permission)
+        echo "Error: The following directories are not writable by your user: $prefix/Cellar"
+        exit 1
+        ;;
+      interrupt-once)
+        if [ ! -f "${MOCK_STATE_DIR:?}/brew-interrupted" ]; then
+          touch "$MOCK_STATE_DIR/brew-interrupted"
+          echo "==> Downloading https://ghcr.io/v2/homebrew/core/gh/blobs/sha256:mock"
+          echo "^C"
+          exit 130
+        fi
+        ;;
+    esac
+    echo "==> Pouring gh--9.9.9.arm64_sonoma.bottle.tar.gz"
+    ln -sf "${MOCK_DIR:?}/gh" "$prefix/bin/gh"
+    echo "🍺  $prefix/Cellar/gh/9.9.9: 200 files, 50MB"
+    ;;
+  *) exit 1 ;;
+esac

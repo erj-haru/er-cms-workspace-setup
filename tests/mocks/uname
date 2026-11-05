@@ -1,3 +1,7 @@
 #!/bin/bash
-# テスト用の uname モック（MOCK_UNAME で OS 名を切り替える。既定は Darwin）
-echo "${MOCK_UNAME:-Darwin}"
+# テスト用の uname モック
+#   MOCK_UNAME（既定 Darwin）: -s の値 / MOCK_ARCH（既定 arm64）: -m の値
+case "${1-}" in
+  -m) echo "${MOCK_ARCH:-arm64}" ;;
+  *) echo "${MOCK_UNAME:-Darwin}" ;;
+esac

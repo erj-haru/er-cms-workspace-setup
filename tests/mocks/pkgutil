@@ -1,0 +1,16 @@
+#!/bin/bash
+# テスト用の pkgutil モック（MOCK_PKG_SIG=ok（既定）/ unsigned / wrongteam / notnotarized）
+printf 'pkgutil %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+[ "${1-}" = "--check-signature" ] || exit 1
+case "${MOCK_PKG_SIG:-ok}" in
+  unsigned) echo "Package \"Homebrew.pkg\":"; echo "   Status: no signature"; exit 1 ;;
+  wrongteam) team="Developer ID Installer: Someone Else (ABCDE12345)"; notary="Notarization: trusted by the Apple notary service" ;;
+  notnotarized) team="Developer ID Installer: Patrick Linnane (927JGANW46)"; notary="" ;;
+  *) team="Developer ID Installer: Patrick Linnane (927JGANW46)"; notary="Notarization: trusted by the Apple notary service" ;;
+esac
+echo "Package \"Homebrew.pkg\":"
+echo "   Status: signed by a developer certificate issued by Apple for distribution"
+[ -n "$notary" ] && echo "   $notary"
+echo "   Certificate Chain:"
+echo "    1. ${team}"
+exit 0

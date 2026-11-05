@@ -6,7 +6,13 @@
 # Claude Code の Skill「/setup-workspace」から呼び出される。
 #
 # 使い方:
-#   bash setup.sh check            環境（macOS / Git / gh / ログイン / 権限）を確認
+#   bash setup.sh check            環境（macOS / CPU / 開発者ツール / Git / Homebrew / gh / ログイン / 権限）を確認
+#   bash setup.sh install-clt      Apple の開発者ツール（Git を含む）を追加（利用者の承認後）
+#   bash setup.sh install-brew     Homebrew 公式インストーラーを取得・確認して開く（利用者の承認後）
+#   bash setup.sh install-gh       Homebrew で GitHub CLI を追加（利用者の承認後）
+#   bash setup.sh wait <clt|brew>  インストールの完了を待つ（途中からの再開用）
+#   bash setup.sh path-status      Homebrew が今後のターミナルでも使えるか確認（変更なし）
+#   bash setup.sh persist-path     シェルの設定に brew shellenv を追記（必要な場合のみ・利用者の承認後）
 #   bash setup.sh accounts         ログイン済みの GitHub アカウントを表示（変更なし）
 #   bash setup.sh switch <名前>    ログイン済みの別アカウントに切り替える（利用者の承認後）
 #   bash setup.sh login            ブラウザで GitHub にログインする（利用者の承認後）
@@ -26,9 +32,11 @@
 #
 # 安全方針:
 #   - 認証情報（トークン・パスワード）を表示・保存しない
-#   - 既存のファイルやフォルダを削除・上書きしない（rm は使わない）
+#   - 既存のファイルやフォルダを削除・上書きしない（rm は自分で作った一時ファイルにだけ使う）
 #   - 既存リポジトリに対して fetch / pull / reset / commit / push をしない
-#   - ソフトウェアのインストールやログアウトをしない
+#   - インストールは install-* を明示的に呼んだときだけ行う。sudo は使わない
+#     （管理者の確認は macOS の正式な画面に任せる）。インストール済みのものは入れ直さない
+#   - ログアウトをしない
 #   - GitHub のワンタイムコードは画面に出さず、クリップボード経由で渡す
 #
 # macOS 標準の /bin/bash（3.2）で動くように書いている。
@@ -49,23 +57,6 @@ readonly EXIT_ACTION=1
 readonly EXIT_FAIL=2
 readonly EXIT_DEST=3
 readonly EXIT_USAGE=64
-
-# Claude Desktop から起動した場合、Homebrew の場所が PATH に入っていないことがある。
-# 既定では Homebrew の標準の場所を PATH の末尾に補う（既存の PATH が優先）。
-# テストでは SETUP_WORKSPACE_EXTRA_PATH="" として実機のツールを見ないようにする。
-extra_path="${SETUP_WORKSPACE_EXTRA_PATH-/opt/homebrew/bin:/usr/local/bin}"
-if [ -n "$extra_path" ]; then
-  old_ifs=$IFS
-  IFS=:
-  for d in $extra_path; do
-    case ":${PATH}:" in
-      *":${d}:"*) ;;
-      *) [ -d "$d" ] && PATH="${PATH}:${d}" ;;
-    esac
-  done
-  IFS=$old_ifs
-  export PATH
-fi
 
 # -----------------------------------------------------------------------------
 # 出力用
@@ -95,24 +86,179 @@ trap on_exit EXIT
 sanitize() { sed -E 's#(https?://)[^/@[:space:]]+@#\1***@#g'; }
 
 # -----------------------------------------------------------------------------
-# ツールの確認
+# 環境の検出
+#
+# - PATH に登録されていないだけのツールを「未導入」と誤判定しないよう、
+#   Homebrew・Git・gh の標準の場所も探し、見つかればこのプロセスの PATH に加える
+#   （brew shellenv が PATH に加える bin / sbin と同じ。設定ファイルは変更しない）
+# - macOS の /usr/bin/git は、開発者ツールが未導入だと実行時にインストール画面を出すため、
+#   開発者ツールの有無を先に確かめてから実行する
+# - SYS_ROOT はシステムの場所の基準（通常は空 = 実際のルート）。テストでは一時フォルダを
+#   指定し、実機の /opt/homebrew や /Library を見ないようにする
 # -----------------------------------------------------------------------------
+SYS_ROOT="${SETUP_WORKSPACE_ROOT:-}"
+INSTALL_TIMEOUT="${SETUP_WORKSPACE_INSTALL_TIMEOUT:-540}"
+POLL_INTERVAL="${SETUP_WORKSPACE_POLL_INTERVAL:-5}"
+case "$INSTALL_TIMEOUT" in '' | *[!0-9]*) INSTALL_TIMEOUT=540 ;; esac
+case "$POLL_INTERVAL" in '' | *[!0-9]* | 0) POLL_INTERVAL=5 ;; esac
+
+# Homebrew 公式の macOS 用インストーラー（.pkg）の配布元と署名者（Apple Developer の Team ID）
+readonly BREW_RELEASE_API="https://api.github.com/repos/Homebrew/brew/releases/latest"
+readonly BREW_PKG_URL_PREFIX="https://github.com/Homebrew/brew/releases/download/"
+readonly BREW_PKG_TEAM_ID="927JGANW46"
+
+path_prepend() {
+  case ":${PATH}:" in
+    *":$1:"*) ;;
+    *) PATH="$1${PATH:+:${PATH}}" ;;
+  esac
+  export PATH
+}
+
 is_macos() {
   [ "$(uname -s 2>/dev/null)" = "Darwin" ]
 }
 
-# macOS の /usr/bin/git は、開発者ツールが未導入だと実行に失敗するため、実際に動かして確認する
-has_git() {
-  command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1
+# 検出結果
+CPU=""            # apple_silicon / intel
+ARCH=""           # uname -m の値（arm64 / x86_64）
+ROSETTA="no"      # Apple シリコンで Intel 用として動いているか
+BREW_EXPECTED_PREFIX=""
+CLT_OK=0
+DEV_DIR=""
+GIT_PATH=""
+GIT_ON_PATH="no"
+BREW_PATH=""
+BREW_PREFIX=""
+BREW_ON_PATH="no"
+GH_PATH=""
+GH_ON_PATH="no"
+IS_ADMIN="unknown"
+MANAGED="unknown"
+
+detect_arch() {
+  ARCH=$(uname -m 2>/dev/null) || ARCH=""
+  if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+    CPU="apple_silicon"
+    [ "$ARCH" = "x86_64" ] && ROSETTA="yes"
+    BREW_EXPECTED_PREFIX="${SYS_ROOT}/opt/homebrew"
+  else
+    CPU="intel"
+    BREW_EXPECTED_PREFIX="${SYS_ROOT}/usr/local"
+  fi
 }
 
-has_gh() {
-  command -v gh >/dev/null 2>&1 && gh --version >/dev/null 2>&1
+detect_clt() {
+  CLT_OK=0
+  DEV_DIR=$(xcode-select -p 2>/dev/null) || DEV_DIR=""
+  if [ -n "$DEV_DIR" ] && [ -d "$DEV_DIR" ]; then
+    CLT_OK=1
+  fi
 }
 
-has_brew() {
-  command -v brew >/dev/null 2>&1
+# 実際に動く git を探す（見つかった場所を PATH に加える）
+detect_git() {
+  GIT_PATH=""
+  GIT_ON_PATH="no"
+  local first cand
+  first=$(command -v git 2>/dev/null) || first=""
+  for cand in "$first" \
+    "${SYS_ROOT}/Library/Developer/CommandLineTools/usr/bin/git" \
+    "${DEV_DIR:+${DEV_DIR}/usr/bin/git}" \
+    "${BREW_PREFIX:+${BREW_PREFIX}/bin/git}"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    # 開発者ツールがない状態で /usr/bin/git を実行すると、インストール画面が勝手に出てしまう
+    if [ "$cand" = "${SYS_ROOT}/usr/bin/git" ] && [ $CLT_OK -ne 1 ]; then
+      continue
+    fi
+    if "$cand" --version >/dev/null 2>&1; then
+      GIT_PATH="$cand"
+      [ "$cand" = "$first" ] && GIT_ON_PATH="yes"
+      path_prepend "${cand%/*}"
+      return 0
+    fi
+  done
+  return 1
 }
+
+detect_brew() {
+  BREW_PATH=""
+  BREW_PREFIX=""
+  BREW_ON_PATH="no"
+  local first cand
+  first=$(command -v brew 2>/dev/null) || first=""
+  for cand in "$first" "${SYS_ROOT}/opt/homebrew/bin/brew" "${SYS_ROOT}/usr/local/bin/brew"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    BREW_PATH="$cand"
+    [ "$cand" = "$first" ] && BREW_ON_PATH="yes"
+    BREW_PREFIX=$("$cand" --prefix 2>/dev/null) || BREW_PREFIX=""
+    if [ -z "$BREW_PREFIX" ] || [ ! -d "$BREW_PREFIX" ]; then
+      BREW_PREFIX="${cand%/bin/brew}"
+    fi
+    # brew shellenv と同じく、このプロセスの PATH に bin と sbin を加える
+    [ -d "${BREW_PREFIX}/sbin" ] && path_prepend "${BREW_PREFIX}/sbin"
+    path_prepend "${BREW_PREFIX}/bin"
+    path_prepend "${cand%/*}"
+    return 0
+  done
+  return 1
+}
+
+detect_gh() {
+  GH_PATH=""
+  GH_ON_PATH="no"
+  local first cand
+  first=$(command -v gh 2>/dev/null) || first=""
+  for cand in "$first" "${BREW_PREFIX:+${BREW_PREFIX}/bin/gh}" "${SYS_ROOT}/opt/homebrew/bin/gh" "${SYS_ROOT}/usr/local/bin/gh"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if "$cand" --version >/dev/null 2>&1; then
+      GH_PATH="$cand"
+      [ "$cand" = "$first" ] && GH_ON_PATH="yes"
+      path_prepend "${cand%/*}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_admin() {
+  local groups g
+  IS_ADMIN="unknown"
+  groups=$(id -Gn 2>/dev/null) || return 0
+  IS_ADMIN="no"
+  for g in $groups; do
+    [ "$g" = "admin" ] && IS_ADMIN="yes"
+  done
+}
+
+# 学校・会社の管理（MDM）下にあるか（参考情報。判定できなければ unknown）
+detect_managed() {
+  local out
+  MANAGED="unknown"
+  out=$(profiles status -type enrollment 2>/dev/null) || return 0
+  case "$out" in
+    *"MDM enrollment: Yes"* | *"Enrolled via DEP: Yes"*) MANAGED="yes" ;;
+    *"MDM enrollment: No"*) MANAGED="no" ;;
+  esac
+}
+
+# まとめて検出する（macOS のときだけ呼ぶ）
+detect_all() {
+  detect_arch
+  detect_clt
+  detect_brew
+  detect_git
+  detect_gh
+}
+
+DETECTED=0
+ensure_detected() {
+  [ $DETECTED -eq 1 ] && return 0
+  detect_all
+  DETECTED=1
+}
+has_git() { ensure_detected; [ -n "$GIT_PATH" ]; }
+has_gh() { ensure_detected; [ -n "$GH_PATH" ]; }
 
 to_lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
 
@@ -131,8 +277,46 @@ url_matches_repo() {
   return 1
 }
 
+# Homebrew の bin が、今後開くターミナル（ログインシェル）でも使えるか
+#   /etc/paths・/etc/paths.d（公式 .pkg は /etc/paths.d/homebrew を作る）か、
+#   シェルの設定ファイルに brew shellenv / bin の場所が書かれていれば「使える」
+PROFILE_FILE=""
+brew_path_persisted() {
+  local bin="${BREW_PREFIX}/bin" f line content
+  for f in "${SYS_ROOT}/etc/paths" "${SYS_ROOT}"/etc/paths.d/*; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ "$line" = "$bin" ] && return 0
+    done <"$f"
+  done
+  for f in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.zlogin" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.profile"; do
+    [ -f "$f" ] || continue
+    content=$(cat "$f" 2>/dev/null) || continue
+    case "$content" in
+      *"brew shellenv"* | *"${bin}"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+choose_profile_file() {
+  case "${SHELL##*/}" in
+    zsh | "") PROFILE_FILE="$HOME/.zprofile" ;;
+    bash) PROFILE_FILE="$HOME/.bash_profile" ;;
+    *) PROFILE_FILE="" ;;
+  esac
+}
+
+# 既定の保存先に、正しい Clone が既にあるか
+existing_default_clone() {
+  [ -n "$GIT_PATH" ] || return 1
+  resolve_dest "~/${DEFAULT_PARENT_NAME}" >/dev/null 2>&1 || return 1
+  inspect_dest "$DEST"
+  [ "$STATE" = "reuse" ]
+}
+
 # -----------------------------------------------------------------------------
-# check: 環境確認
+# check: 環境確認（何も変更しない）
 # -----------------------------------------------------------------------------
 cmd_check() {
   say "== 準備状況の確認 =="
@@ -142,41 +326,465 @@ cmd_check() {
     kv RESULT UNSUPPORTED_OS
     return $EXIT_ACTION
   fi
-  say "✅ Mac を確認しました"
+  detect_all
+  detect_admin
+  detect_managed
 
-  local brew_state=no
-  if has_brew; then brew_state=yes; fi
+  local cpu_label="Intel"
+  [ "$CPU" = "apple_silicon" ] && cpu_label="Apple シリコン"
+  say "✅ Mac を確認しました（${cpu_label}）"
+  [ "$ROSETTA" = "yes" ] && say "ℹ️ Intel 用の互換モード（Rosetta）で動いています"
 
-  local missing=""
-  if has_git; then
+  if [ $CLT_OK -eq 1 ]; then
+    say "✅ Apple の開発者ツール（Command Line Tools）: 入っています"
+  else
+    say "❌ Apple の開発者ツール（Command Line Tools）: 入っていません"
+  fi
+  if [ -n "$GIT_PATH" ]; then
     say "✅ Git（ファイルの履歴を管理する道具）: 使えます（$(git --version 2>/dev/null)）"
   else
     say "❌ Git（ファイルの履歴を管理する道具）: 見つかりません"
-    missing="git"
   fi
-
-  if has_gh; then
+  if [ -n "$BREW_PATH" ]; then
+    say "✅ Homebrew（Mac 用のソフト追加ツール）: 使えます（${BREW_PREFIX}）"
+    [ "$BREW_ON_PATH" = "no" ] && say "   ※ 入っていましたが、コマンドの検索先（PATH）に登録されていなかったため、この処理の中で補いました"
+  else
+    say "❌ Homebrew（Mac 用のソフト追加ツール）: 見つかりません"
+  fi
+  if [ -n "$GH_PATH" ]; then
     say "✅ GitHub CLI（gh）: 使えます（$(gh --version 2>/dev/null | sed -n '1p')）"
   else
     say "❌ GitHub CLI（gh）: 見つかりません"
-    missing="${missing:+${missing},}gh"
+  fi
+  [ "$MANAGED" = "yes" ] && say "ℹ️ この Mac は学校・会社などの管理下にあります。インストールが制限されている場合があります"
+  [ "$IS_ADMIN" = "no" ] && say "ℹ️ このユーザーは Mac の管理者ではありません。ソフトの追加には管理者の協力が必要な場合があります"
+
+  kv OS macos
+  kv CPU "$CPU"
+  kv ARCH "$ARCH"
+  kv ROSETTA "$ROSETTA"
+  kv CLT "$([ $CLT_OK -eq 1 ] && echo installed || echo missing)"
+  kv GIT "$([ -n "$GIT_PATH" ] && echo yes || echo no)"
+  kv BREW "$([ -n "$BREW_PATH" ] && echo yes || echo no)"
+  if [ -n "$BREW_PATH" ]; then
+    kv BREW_PREFIX "$BREW_PREFIX"
+    kv BREW_ON_PATH "$BREW_ON_PATH"
+    kv BREW_PATH_PERSISTED "$(brew_path_persisted && echo yes || echo no)"
+  fi
+  kv GH "$([ -n "$GH_PATH" ] && echo yes || echo no)"
+  kv IS_ADMIN "$IS_ADMIN"
+  kv MANAGED "$MANAGED"
+
+  # 足りないもの（MISSING）と、入れる順番（INSTALL_PLAN）
+  local missing="" plan=""
+  [ -n "$GIT_PATH" ] || missing="git"
+  [ -n "$GH_PATH" ] || missing="${missing:+${missing},}gh"
+  if [ -z "$GIT_PATH" ] || { [ -z "$GH_PATH" ] && [ -z "$BREW_PATH" ] && [ $CLT_OK -ne 1 ]; }; then
+    plan="clt"
+  fi
+  if [ -z "$GH_PATH" ]; then
+    [ -z "$BREW_PATH" ] && plan="${plan:+${plan},}brew"
+    plan="${plan:+${plan},}gh"
   fi
 
-  if [ -n "$missing" ]; then
-    if [ "$brew_state" = yes ]; then
-      say "ℹ️ Homebrew（Mac 用のソフト追加ツール）は使えます"
-    else
-      say "ℹ️ Homebrew（Mac 用のソフト追加ツール）は見つかりません"
-    fi
-    say "→ 不足しているソフトの追加が必要です。"
-    kv RESULT NEED_INSTALL
+  if [ -n "$plan" ]; then
+    local brew_auto=yes
+    [ "$CPU" = "apple_silicon" ] || brew_auto=no
+    say "→ 次のソフトの追加が必要です（この順番で進めます）: ${plan}"
     kv MISSING "$missing"
-    kv BREW "$brew_state"
+    kv INSTALL_PLAN "$plan"
+    kv BREW_AUTO_INSTALL "$brew_auto"
+    kv NEXT "install-${plan%%,*}"
+    kv RESULT NEED_INSTALL
     return $EXIT_ACTION
   fi
 
-  kv BREW "$brew_state"
+  if existing_default_clone; then
+    kv EXISTING_CLONE "$DEST"
+  fi
   report_auth
+}
+
+# -----------------------------------------------------------------------------
+# ソフトの追加（Skill が利用者の承認を得てから、1 つずつ呼ぶ）
+#
+# - sudo は使わない。管理者の確認が必要な場合は macOS の正式な画面（インストーラー）に任せる
+# - インストール済みのものは入れ直さない
+# - 途中で止まっても、もう一度実行すれば続きから再開できる
+# -----------------------------------------------------------------------------
+
+# 指定した条件が満たされるまで待つ: wait_until <確認用の関数> <残り秒数>
+wait_until() {
+  local fn="$1" limit="$2" start=$SECONDS
+  while :; do
+    "$fn" && return 0
+    [ $((SECONDS - start)) -ge "$limit" ] && return 1
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+clt_ready() {
+  detect_clt
+  [ $CLT_OK -eq 1 ] && detect_git
+}
+
+brew_ready() {
+  detect_brew && "$BREW_PATH" --version >/dev/null 2>&1
+}
+
+report_clt_ready() {
+  say "✅ Apple の開発者ツールと Git が使えるようになりました（$(git --version 2>/dev/null)）"
+  kv RESULT CLT_READY
+  return $EXIT_OK
+}
+
+# install-clt: Apple の開発者ツール（Git を含む）を、macOS 標準の方法で追加する
+cmd_install_clt() {
+  if ! is_macos; then
+    say "❌ このパソコンは macOS ではないようです。"
+    kv RESULT UNSUPPORTED_OS
+    return $EXIT_ACTION
+  fi
+  detect_all
+  if [ $CLT_OK -eq 1 ] && [ -n "$GIT_PATH" ]; then
+    say "ℹ️ Apple の開発者ツールは既に入っています。入れ直しはしません。"
+    kv ACTION unchanged
+    report_clt_ready
+    return $?
+  fi
+  if [ $CLT_OK -ne 1 ] && [ -n "$GIT_PATH" ]; then
+    say "ℹ️ Git は既に使えます（開発者ツールは Homebrew の追加時に必要になります）。"
+  fi
+
+  local out rc
+  out=$(xcode-select --install 2>&1)
+  rc=$?
+  case "$(to_lower "$out")" in
+    *"already installed"*)
+      if clt_ready; then
+        kv ACTION unchanged
+        report_clt_ready
+        return $?
+      fi
+      say "❌ 開発者ツールは入っているとのことですが、Git を確認できませんでした。"
+      say "対処: Mac の「システム設定」→「一般」→「ソフトウェアアップデート」で更新を確認してください。"
+      kv RESULT CLT_FAILED
+      return $EXIT_FAIL
+      ;;
+  esac
+  if [ $rc -ne 0 ]; then
+    say "❌ 開発者ツールのインストールを開始できませんでした。"
+    [ -n "$out" ] && printf '%s\n' "$out" | mask_secrets | sed -n '1,5p'
+    say "学校や会社の Mac では、管理者によってインストールが制限されている場合があります。その場合は管理者に相談してください。"
+    kv RESULT CLT_FAILED
+    return $EXIT_FAIL
+  fi
+  kv ACTION install_requested
+  say "🖥 画面に「コマンドライン・デベロッパツール」のインストール確認が表示されます。"
+  say "   「インストール」を押し、利用許諾に「同意する」を選んでください。完了まで待っています（最大 $(((INSTALL_TIMEOUT + 59) / 60)) 分）。"
+  wait_install clt
+}
+
+# wait <clt|brew>: インストールの完了を待つだけ（何も始めない）。途中から再開するときに使う
+wait_install() {
+  case "$1" in
+    clt)
+      if wait_until clt_ready "$INSTALL_TIMEOUT"; then
+        report_clt_ready
+        return $?
+      fi
+      say "⏳ まだ開発者ツールのインストールが終わっていません。"
+      say "   画面の表示に従って進めてください。エラーが表示された場合や、確認画面が見当たらない場合は教えてください。"
+      kv NEXT "wait clt"
+      kv RESULT INSTALL_WAITING
+      return $EXIT_ACTION
+      ;;
+    brew)
+      if wait_until brew_ready "$INSTALL_TIMEOUT"; then
+        report_brew_ready
+        return $?
+      fi
+      say "⏳ まだ Homebrew のインストールが終わっていません。"
+      say "   インストーラーの画面で最後まで進めてください。エラーが表示された場合や、画面を閉じてしまった場合は教えてください。"
+      kv NEXT "wait brew"
+      kv RESULT INSTALL_WAITING
+      return $EXIT_ACTION
+      ;;
+  esac
+  usage
+  return $EXIT_USAGE
+}
+
+cmd_wait() {
+  if ! is_macos; then
+    kv RESULT UNSUPPORTED_OS
+    return $EXIT_ACTION
+  fi
+  detect_all
+  wait_install "$1"
+}
+
+BREW_PKG_DIR=""
+report_brew_ready() {
+  # インストールが終わったら、ダウンロードしたインストーラーを片付ける（自分で作ったファイルのみ）
+  if [ -n "$BREW_PKG_DIR" ] && [ -f "${BREW_PKG_DIR}/Homebrew.pkg" ]; then
+    rm -f "${BREW_PKG_DIR}/Homebrew.pkg"
+    rmdir "$BREW_PKG_DIR" 2>/dev/null
+  fi
+  say "✅ Homebrew が使えるようになりました（${BREW_PREFIX}、$("$BREW_PATH" --version 2>/dev/null | sed -n '1p')）"
+  kv BREW_PREFIX "$BREW_PREFIX"
+  kv BREW_PATH_PERSISTED "$(brew_path_persisted && echo yes || echo no)"
+  kv RESULT BREW_READY
+  return $EXIT_OK
+}
+
+# ダウンロード済みのインストーラーが、Homebrew 公式の署名・Apple の公証を受けたものか確かめる
+verify_brew_pkg() {
+  local pkg="$1" sig gk
+  sig=$(pkgutil --check-signature "$pkg" 2>&1) || return 1
+  case "$sig" in
+    *"Developer ID Installer:"*"(${BREW_PKG_TEAM_ID})"*) ;;
+    *) return 1 ;;
+  esac
+  case "$sig" in
+    *"Notarization: trusted by the Apple notary service"*) ;;
+    *) return 1 ;;
+  esac
+  gk=$(spctl --assess --type install -vv "$pkg" 2>&1) || return 1
+  case "$gk" in
+    *accepted*"Notarized Developer ID"*) return 0 ;;
+  esac
+  return 1
+}
+
+# install-brew: Homebrew 公式のインストーラー（.pkg）を取得・確認し、macOS のインストーラーで開く
+cmd_install_brew() {
+  if ! is_macos; then
+    say "❌ このパソコンは macOS ではないようです。"
+    kv RESULT UNSUPPORTED_OS
+    return $EXIT_ACTION
+  fi
+  detect_all
+  detect_admin
+  if [ -n "$BREW_PATH" ]; then
+    say "ℹ️ Homebrew は既に入っています（${BREW_PREFIX}）。入れ直しはしません。"
+    kv ACTION unchanged
+    report_brew_ready
+    return $?
+  fi
+  if [ "$CPU" != "apple_silicon" ]; then
+    say "❌ この Mac（Intel）では、Homebrew をこの画面から自動で入れることができません。"
+    say "   （Homebrew 公式の Mac 用インストーラーは Apple シリコン専用のため）"
+    kv RESULT BREW_AUTO_UNSUPPORTED
+    return $EXIT_ACTION
+  fi
+  if [ $CLT_OK -ne 1 ]; then
+    say "❌ 先に Apple の開発者ツール（Command Line Tools）を入れる必要があります。"
+    kv NEXT install-clt
+    kv RESULT NEED_CLT
+    return $EXIT_ACTION
+  fi
+  if [ "$IS_ADMIN" = "no" ]; then
+    say "❌ このユーザーは Mac の管理者ではないため、Homebrew を入れることができません。"
+    say "   学校や会社の Mac の場合は、管理者に相談してください。"
+    kv RESULT NO_ADMIN
+    return $EXIT_ACTION
+  fi
+  local tool
+  for tool in curl pkgutil spctl open mktemp; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      say "❌ インストールに必要な Mac の機能（${tool}）が見つかりません。"
+      kv RESULT BREW_INSTALL_FAILED
+      return $EXIT_FAIL
+    fi
+  done
+
+  local start=$SECONDS meta url
+  say "⏳ Homebrew 公式の配布元から、インストーラーの情報を取得しています"
+  if ! meta=$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 "$BREW_RELEASE_API" 2>&1); then
+    say "❌ インストーラーの情報を取得できませんでした。インターネット接続を確認してください。"
+    kv RESULT BREW_DOWNLOAD_FAILED
+    return $EXIT_FAIL
+  fi
+  url=$(printf '%s\n' "$meta" | sed -nE 's#.*"browser_download_url"[[:space:]]*:[[:space:]]*"(https://github\.com/Homebrew/brew/releases/download/[A-Za-z0-9._-]+/Homebrew[A-Za-z0-9._-]*\.pkg)".*#\1#p' | sed -n '1p')
+  case "$url" in
+    "${BREW_PKG_URL_PREFIX}"*.pkg) ;;
+    *)
+      say "❌ 公式のインストーラーが見つかりませんでした。安全のため、何も実行せずに中止します。"
+      kv RESULT BREW_DOWNLOAD_FAILED
+      return $EXIT_FAIL
+      ;;
+  esac
+
+  BREW_PKG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/setup-workspace-brew.XXXXXX") || BREW_PKG_DIR=""
+  if [ -z "$BREW_PKG_DIR" ]; then
+    say "❌ 一時的な作業場所を用意できませんでした。"
+    kv RESULT BREW_INSTALL_FAILED
+    return $EXIT_FAIL
+  fi
+  chmod 700 "$BREW_PKG_DIR"
+  local pkg="${BREW_PKG_DIR}/Homebrew.pkg"
+  say "⏳ インストーラーをダウンロードしています（150MB 程度。数分かかることがあります）"
+  if ! curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 420 -o "$pkg" "$url" 2>/dev/null || [ ! -s "$pkg" ]; then
+    rm -f "$pkg"
+    rmdir "$BREW_PKG_DIR" 2>/dev/null
+    say "❌ インストーラーをダウンロードできませんでした。何も実行していません。インターネット接続を確認して、もう一度お試しください。"
+    kv RESULT BREW_DOWNLOAD_FAILED
+    return $EXIT_FAIL
+  fi
+  if ! verify_brew_pkg "$pkg"; then
+    rm -f "$pkg"
+    rmdir "$BREW_PKG_DIR" 2>/dev/null
+    say "❌ ダウンロードしたインストーラーが、Homebrew 公式の署名付きのものと確認できませんでした。安全のため、実行せずに削除しました。"
+    kv RESULT BREW_VERIFY_FAILED
+    return $EXIT_FAIL
+  fi
+  say "✅ インストーラーが Homebrew 公式のもの（Apple の確認済み）であることを確認しました"
+
+  if ! open "$pkg" >/dev/null 2>&1; then
+    say "❌ macOS のインストーラーを開けませんでした。"
+    kv RESULT BREW_INSTALL_FAILED
+    return $EXIT_FAIL
+  fi
+  kv ACTION installer_opened
+  say "🖥 macOS の「インストーラー」が開きました。画面の指示に従って「続ける」「インストール」を押してください。"
+  say "   途中で Mac のパスワード（または Touch ID）を求められます。これは macOS の正式な確認画面です。ご本人が入力してください（このチャットには入力しないでください）。"
+  local remaining=$((INSTALL_TIMEOUT - (SECONDS - start)))
+  [ $remaining -lt 30 ] && remaining=30
+  INSTALL_TIMEOUT=$remaining
+  wait_install brew
+}
+
+# install-gh: Homebrew で GitHub CLI を追加する
+cmd_install_gh() {
+  if ! is_macos; then
+    say "❌ このパソコンは macOS ではないようです。"
+    kv RESULT UNSUPPORTED_OS
+    return $EXIT_ACTION
+  fi
+  detect_all
+  if [ -n "$GH_PATH" ]; then
+    say "ℹ️ GitHub CLI（gh）は既に入っています。入れ直しはしません。"
+    say "✅ $(gh --version 2>/dev/null | sed -n '1p')"
+    kv ACTION unchanged
+    kv RESULT GH_READY
+    return $EXIT_OK
+  fi
+  if [ -z "$BREW_PATH" ]; then
+    say "❌ 先に Homebrew を入れる必要があります。"
+    kv NEXT install-brew
+    kv RESULT NEED_BREW
+    return $EXIT_ACTION
+  fi
+  say "⏳ Homebrew で GitHub CLI（gh）を追加しています（1〜数分かかります）"
+  local out rc
+  out=$(HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 "$BREW_PATH" install gh </dev/null 2>&1)
+  rc=$?
+  if detect_gh; then
+    say "✅ GitHub CLI（gh）が使えるようになりました（$(gh --version 2>/dev/null | sed -n '1p')）"
+    kv ACTION installed
+    kv RESULT GH_READY
+    return $EXIT_OK
+  fi
+  say "❌ GitHub CLI（gh）を追加できませんでした。"
+  local lower
+  lower=$(to_lower "$out")
+  case "$lower" in
+    *"already locked"* | *"another active homebrew"* | *"is locked"*)
+      say "原因: Homebrew が別の処理を実行中です。"
+      say "対処: 少し待ってから、もう一度お試しください。"
+      kv RESULT BREW_BUSY
+      ;;
+    *"could not resolve host"* | *"failed to download"* | *"failed to connect"* | *"timed out"* | *"curl:"*)
+      say "原因: インターネットに接続できなかったか、ダウンロードに失敗しました。"
+      say "対処: 接続を確認して、もう一度お試しください（途中まで進んだ分は再利用されます）。"
+      kv RESULT NETWORK_ERROR
+      ;;
+    *"permission denied"* | *"not writable"* | *"operation not permitted"*)
+      say "原因: Homebrew のフォルダに書き込む権限がありません。"
+      say "対処: Homebrew を入れたユーザーと違うユーザーの可能性があります。管理者に相談してください。"
+      kv RESULT BREW_PERMISSION
+      ;;
+    *)
+      say "原因: 予期しないエラーです（終了コード ${rc}）。もう一度お試しください。解決しない場合は下の内容を担当者に伝えてください。"
+      kv RESULT GH_INSTALL_FAILED
+      ;;
+  esac
+  if [ -n "$out" ]; then
+    say "--- エラー内容（最後の部分） ---"
+    printf '%s\n' "$out" | mask_secrets | tail -n 8
+    say "--------------------------------"
+  fi
+  return $EXIT_FAIL
+}
+
+# path-status: Homebrew が今後のターミナルでも使えるか確認する（変更なし）
+cmd_path_status() {
+  is_macos || { kv RESULT UNSUPPORTED_OS; return $EXIT_ACTION; }
+  detect_all
+  if [ -z "$BREW_PATH" ]; then
+    say "ℹ️ Homebrew は入っていません。"
+    kv RESULT NO_BREW
+    return $EXIT_ACTION
+  fi
+  choose_profile_file
+  kv BREW_PREFIX "$BREW_PREFIX"
+  kv PROFILE_FILE "$PROFILE_FILE"
+  if brew_path_persisted; then
+    say "✅ Homebrew は、今後開くターミナルでもそのまま使えます（設定の追加は不要です）"
+    kv BREW_PATH_PERSISTED yes
+  else
+    say "ℹ️ Homebrew は、今後開くターミナルからは見つからない状態です"
+    kv BREW_PATH_PERSISTED no
+  fi
+  kv RESULT OK
+  return $EXIT_OK
+}
+
+readonly PROFILE_MARK_BEGIN="# >>> Est Rouge setup-workspace: Homebrew >>>"
+readonly PROFILE_MARK_END="# <<< Est Rouge setup-workspace: Homebrew <<<"
+
+# persist-path: シェルの設定ファイルに brew shellenv を 1 回だけ追記する（利用者の承認後）
+cmd_persist_path() {
+  is_macos || { kv RESULT UNSUPPORTED_OS; return $EXIT_ACTION; }
+  detect_all
+  if [ -z "$BREW_PATH" ]; then
+    kv RESULT NO_BREW
+    return $EXIT_ACTION
+  fi
+  if brew_path_persisted; then
+    say "ℹ️ 既に設定されています。何も変更しません。"
+    kv RESULT ALREADY_CONFIGURED
+    return $EXIT_OK
+  fi
+  choose_profile_file
+  if [ -z "$PROFILE_FILE" ]; then
+    say "❌ お使いのシェル（${SHELL:-不明}）の設定には自動で対応していません。"
+    kv RESULT UNSUPPORTED_SHELL
+    return $EXIT_ACTION
+  fi
+  if [ -e "$PROFILE_FILE" ] && { [ ! -f "$PROFILE_FILE" ] || [ ! -w "$PROFILE_FILE" ]; }; then
+    say "❌ 設定ファイル「${PROFILE_FILE}」に書き込めません。何も変更していません。"
+    kv RESULT PERSIST_FAILED
+    return $EXIT_FAIL
+  fi
+  # 既存の内容は変えず、末尾に追記するだけ（最後に改行がなければ補う）
+  {
+    if [ -s "$PROFILE_FILE" ] && [ -n "$(tail -c 1 "$PROFILE_FILE")" ]; then
+      printf '\n'
+    fi
+    printf '\n%s\n' "$PROFILE_MARK_BEGIN"
+    printf 'eval "$(%s shellenv)"\n' "${BREW_PREFIX}/bin/brew"
+    printf '%s\n' "$PROFILE_MARK_END"
+  } >>"$PROFILE_FILE" || {
+    say "❌ 設定ファイル「${PROFILE_FILE}」に書き込めませんでした。"
+    kv RESULT PERSIST_FAILED
+    return $EXIT_FAIL
+  }
+  say "✅ 「${PROFILE_FILE}」の末尾に Homebrew の設定を追加しました（既存の内容は変更していません）"
+  kv PROFILE_FILE "$PROFILE_FILE"
+  kv RESULT PATH_PERSISTED
+  return $EXIT_OK
 }
 
 # -----------------------------------------------------------------------------
@@ -1123,6 +1731,12 @@ usage() {
   cat <<'EOF'
 使い方:
   bash setup.sh check            環境を確認する
+  bash setup.sh install-clt      Apple の開発者ツール（Git）を追加する（承認後に実行）
+  bash setup.sh install-brew     Homebrew を追加する（承認後に実行）
+  bash setup.sh install-gh       GitHub CLI を追加する（承認後に実行）
+  bash setup.sh wait <clt|brew>  インストールの完了を待つ
+  bash setup.sh path-status      Homebrew の PATH 設定を確認する
+  bash setup.sh persist-path     シェルの設定に Homebrew を追記する（承認後に実行）
   bash setup.sh accounts         ログイン済みの GitHub アカウントを表示する
   bash setup.sh switch <名前>    ログイン済みの別アカウントに切り替える（承認後に実行）
   bash setup.sh login            ブラウザで GitHub にログインする（承認後に実行）
@@ -1138,6 +1752,15 @@ main() {
   [ $# -gt 0 ] && shift
   case "$sub" in
     check) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_check ;;
+    install-clt) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_install_clt ;;
+    install-brew) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_install_brew ;;
+    install-gh) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_install_gh ;;
+    wait)
+      [ $# -eq 1 ] || { usage; return $EXIT_USAGE; }
+      case "$1" in clt | brew) cmd_wait "$1" ;; *) usage; return $EXIT_USAGE ;; esac
+      ;;
+    path-status) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_path_status ;;
+    persist-path) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_persist_path ;;
     accounts) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_accounts ;;
     switch) [ $# -eq 1 ] || { usage; return $EXIT_USAGE; }; cmd_switch "$1" ;;
     login) [ $# -eq 0 ] || { usage; return $EXIT_USAGE; }; cmd_login ;;

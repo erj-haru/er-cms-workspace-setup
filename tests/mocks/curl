@@ -1,0 +1,42 @@
+#!/bin/bash
+# テスト用の curl モック（実際の通信はしない）。呼び出しを記録する。
+#   MOCK_CURL_API=ok（既定）/ fail / badurl   : Homebrew のリリース情報
+#   MOCK_CURL_PKG=ok（既定）/ fail / empty     : インストーラーのダウンロード
+printf 'curl %s\n' "$*" >> "${MOCK_LOG:-/dev/null}"
+out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    https://*) url="$1" ;;
+  esac
+  shift
+done
+case "$url" in
+  https://api.github.com/repos/Homebrew/brew/releases/latest)
+    case "${MOCK_CURL_API:-ok}" in
+      fail) echo "curl: (6) Could not resolve host: api.github.com" >&2; exit 6 ;;
+      badurl)
+        echo '{"tag_name":"9.9.9","assets":[{"browser_download_url": "https://evil.example.com/Homebrew/brew/releases/download/9.9.9/Homebrew.pkg"}]}'
+        ;;
+      *)
+        echo '{'
+        echo '  "tag_name": "9.9.9",'
+        echo '  "assets": [{'
+        echo '      "browser_download_url": "https://github.com/Homebrew/brew/releases/download/9.9.9/Homebrew.pkg"'
+        echo '  }]'
+        echo '}'
+        ;;
+    esac
+    ;;
+  https://github.com/Homebrew/brew/releases/download/*)
+    case "${MOCK_CURL_PKG:-ok}" in
+      fail) echo "curl: (56) Recv failure" >&2; exit 56 ;;
+      empty) : > "$out" ;;
+      *) echo "MOCK-HOMEBREW-PKG" > "$out" ;;
+    esac
+    ;;
+  *)
+    echo "mock curl: unexpected url: $url" >&2
+    exit 22
+    ;;
+esac
